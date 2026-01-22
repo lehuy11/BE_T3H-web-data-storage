@@ -2,104 +2,222 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 
-// GET all nodes
-router.get("/", async (req, res) => {
-  const result = await pool.query(
-    "SELECT * FROM nodes WHERE deleted_at IS NULL"
-  );
-  res.json(result.rows);
-});
+const auth = require("../../middlewares/auth");
+const requireRole = require("../../middlewares/requireRole");
 
-// CREATE node
-router.post("/", async (req, res) => {
+/* =====================================================
+   GET ALL NODES (user + admin)
+===================================================== */
+router.get("/", auth, async (req, res) => {
   try {
-    const { parentId, type, code, name } = req.body;
+    const result = await pool.query(`
+      SELECT
+        n.id,
+        n.parent_id,
+        n.type,
+        n.code,
+        n.name,
+        n.sort_order,
+        n.created_at,
+        n.updated_at,
 
-    if (!type || !name) {
-      return res.status(400).json({
-        message: "type và name là bắt buộc"
-      });
-    }
+        a.material,
+        a.quantity,
+        a.valid,
+        a.expires,
+        a.status
+      FROM nodes n
+      LEFT JOIN assets a ON a.node_id = n.id
+      WHERE n.deleted_at IS NULL
+      ORDER BY
+        n.parent_id NULLS FIRST,
+        n.sort_order,
+        n.created_at
+    `);
 
-    const result = await pool.query(
-      `INSERT INTO nodes (parent_id, type, code, name)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [parentId || null, type, code, name]
-    );
-
-    res.json(result.rows[0]);
+    res.json(result.rows);
   } catch (err) {
     console.error(err);
-    res.status(500).json({
-      message: "Lỗi server",
-      error: err.message
-    });
+    res.status(500).json({ error: "SERVER_ERROR" });
   }
 });
 
-// DELETE
-router.delete("/:id", async (req, res) => {
-  const { id } = req.params;
+/* =====================================================
+   CREATE NODE (admin only)
+===================================================== */
+router.post("/", auth, requireRole("admin"), async (req, res) => {
   const client = await pool.connect();
 
   try {
-    await client.query("BEGIN");
+    const {
+      parentId,
+      type,
+      code,
+      name,
+      sort_order,
 
-    // 1. Kiểm tra node có tồn tại và chưa bị xóa
-    const check = await client.query(
-      `SELECT id FROM nodes WHERE id = $1 AND deleted_at IS NULL`,
-      [id]
-    );
+      material,
+      quantity,
+      valid,
+      expires,
+      status,
+    } = req.body;
 
-    if (check.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(404).json({
-        message: "Node not found or already deleted",
+    if (!type || !name) {
+      return res.status(400).json({
+        message: "type và name là bắt buộc",
       });
     }
 
-    // 2. Soft delete toàn bộ cây con bằng CTE đệ quy
-    const deleteQuery = `
-      WITH RECURSIVE subtree AS (
-        SELECT id
-        FROM nodes
-        WHERE id = $1
+    await client.query("BEGIN");
 
-        UNION ALL
+    const nodeResult = await client.query(
+      `
+      INSERT INTO nodes (parent_id, type, code, name, sort_order)
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING *
+      `,
+      [parentId || null, type, code || null, name, sort_order || 0],
+    );
 
-        SELECT n.id
-        FROM nodes n
-        INNER JOIN subtree s ON n.parent_id = s.id
-      )
-      UPDATE nodes
-      SET deleted_at = NOW(),
-          updated_at = NOW()
-      WHERE id IN (SELECT id FROM subtree)
-        AND deleted_at IS NULL
-      RETURNING id;
-    `;
+    const node = nodeResult.rows[0];
 
-    const result = await client.query(deleteQuery, [id]);
+    if (type === "asset") {
+      await client.query(
+        `
+        UPDATE assets
+        SET
+          material = COALESCE($1, material),
+          quantity = COALESCE($2, quantity),
+          valid    = COALESCE($3, valid),
+          expires  = $4,
+          status   = COALESCE($5, status)
+        WHERE node_id = $6
+        `,
+        [
+          material,
+          quantity,
+          valid,
+          expires,
+          status,
+          node.id,
+        ],
+      );
+    }
 
     await client.query("COMMIT");
 
-    return res.json({
-      message: "Delete successful",
-      deleted_count: result.rowCount,
-      deleted_ids: result.rows.map(r => r.id),
-    });
-  } catch (error) {
+    res.json(node);
+  } catch (err) {
     await client.query("ROLLBACK");
-    console.error("DELETE /nodes error:", error);
-
-    return res.status(500).json({
-      message: "Internal server error",
-    });
+    console.error(err);
+    res.status(500).json({ error: err.message });
   } finally {
     client.release();
   }
 });
 
+/* =====================================================
+   UPDATE NODE (admin only)
+===================================================== */
+router.put("/:id", auth, requireRole("admin"), async (req, res) => {
+  const { id } = req.params;
+  const { parent_id, type, code, name, sort_order } = req.body;
+
+  if (!type || !name) {
+    return res.status(400).json({
+      message: "type và name là bắt buộc",
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE nodes
+      SET
+        parent_id = $1,
+        type = $2,
+        code = $3,
+        name = $4,
+        sort_order = $5,
+        updated_at = NOW()
+      WHERE id = $6
+        AND deleted_at IS NULL
+      RETURNING *
+      `,
+      [parent_id, type, code, name, sort_order, id],
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: "Node không tồn tại" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* =====================================================
+   DELETE NODE (admin only – SAFE)
+===================================================== */
+router.delete("/:id", auth, requireRole("admin"), async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const nodeResult = await pool.query(
+      `
+      SELECT id
+      FROM nodes
+      WHERE id = $1
+        AND deleted_at IS NULL
+      `,
+      [id],
+    );
+
+    if (nodeResult.rowCount === 0) {
+      return res.status(404).json({
+        error: "NOT_FOUND",
+        message: "Node không tồn tại hoặc đã bị xóa",
+      });
+    }
+
+    const childResult = await pool.query(
+      `
+      SELECT 1
+      FROM nodes
+      WHERE parent_id = $1
+        AND deleted_at IS NULL
+      LIMIT 1
+      `,
+      [id],
+    );
+
+    if (childResult.rowCount > 0) {
+      return res.status(409).json({
+        error: "HAS_CHILDREN",
+        message: "Không thể xóa node vì vẫn còn node con",
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE nodes
+      SET deleted_at = NOW()
+      WHERE id = $1
+      `,
+      [id],
+    );
+
+    res.json({
+      success: true,
+      deleted_id: id,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "SERVER_ERROR" });
+  }
+});
 
 module.exports = router;
