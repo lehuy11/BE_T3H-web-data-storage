@@ -2,40 +2,45 @@ const express = require("express");
 const router = express.Router();
 const pool = require("../db");
 
-const auth = require("../../middlewares/auth");
-const requireRole = require("../../middlewares/requireRole");
+const auth = require("../middlewares/auth");
+const requireRole = require("../middlewares/requireRole");
 
 /* =====================================================
    GET ALL NODES (user + admin)
 ===================================================== */
-router.get("/", auth, async (req, res) => {
+router.get("/tree", auth, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT
-        n.id,
-        n.parent_id,
-        n.type,
-        n.code,
-        n.name,
-        n.sort_order,
-        n.created_at,
-        n.updated_at,
+    const user = req.user; // { id, role }
 
-        a.material,
-        a.quantity,
-        a.valid,
-        a.expires,
-        a.status
-      FROM nodes n
-      LEFT JOIN assets a ON a.node_id = n.id
-      WHERE n.deleted_at IS NULL
-      ORDER BY
-        n.parent_id NULLS FIRST,
-        n.sort_order,
-        n.created_at
+    // DEV: mock scope
+    let scopeCondition = "";
+    if (user.role === "unit_manager") {
+      scopeCondition = `
+        AND root.type = 'ST_UNIT'
+      `;
+    }
+
+    const result = await pool.query(`
+      WITH RECURSIVE tree AS (
+        SELECT n.*
+        FROM nodes n
+        WHERE n.deleted_at IS NULL
+          AND n.parent_id IS NULL
+        UNION ALL
+        SELECT c.*
+        FROM nodes c
+        JOIN tree p ON p.id = c.parent_id
+        WHERE c.deleted_at IS NULL
+      )
+      SELECT *
+      FROM tree
+      ORDER BY parent_id NULLS FIRST, sort_order
     `);
 
-    res.json(result.rows);
+    res.json({
+      user,
+      tree: result.rows,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "SERVER_ERROR" });
