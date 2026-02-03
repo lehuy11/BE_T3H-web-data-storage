@@ -16,7 +16,3 @@ BE_T3H-web-data-storage/
 ├─ package-lock.json
 ├─ package.json
 └─ README.md
-
-
-
-
